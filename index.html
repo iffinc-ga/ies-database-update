@@ -29,7 +29,7 @@
       "99030159","99030160","99030161","99030162","99030163","99030164",
       "99030165","99030166","99030167","99030168","99030169","99030170",
       "99030171","99030172","99030173","99030174","99030175","99030176",
-      "99030177","99030181","99030182","99030183","99030190",
+      "99030177","99030181","99030182","99030183","99030184","99030187","99030190",
       "99030202","99030203","99030204","99030205","99030206","99030207",
       "99030208","99030209","99030210","99030211","99030212","99030213",
       "99030214","99030215","99030216","99030217","99030218","99030219",
@@ -101,16 +101,20 @@
         while (fields.length < headers.length) fields.push("");
 
         // Step 1: Replace IEEPA codes
-        // First IEEPA code found → replacement (99030306 if it was 99030133, else 99030301)
+        // 99030133 → always replaced with 99030306 (regardless of position)
+        // First other IEEPA code → replaced with 99030301
         // Any additional IEEPA codes on same record → blank
         let firstReplaced = false;
         for (const pos of tariffPositions) {
           const stripped = (fields[pos] || "").trim();
           if (IEEPA_CODES.has(stripped)) {
             stats.codes_found[stripped] = (stats.codes_found[stripped] || 0) + 1;
-            if (!firstReplaced) {
-              // NEW RULE: 99030133 as the first tariff gets its own specific replacement
-              fields[pos] = (stripped === "99030133") ? REPLACEMENT_133 : REPLACEMENT;
+            if (stripped === "99030133") {
+              // Always replace 99030133 with 99030306, no matter its position
+              fields[pos] = REPLACEMENT_133;
+              firstReplaced = true;
+            } else if (!firstReplaced) {
+              fields[pos] = REPLACEMENT;
               firstReplaced = true;
             } else {
               fields[pos] = "";

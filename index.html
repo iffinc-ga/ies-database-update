@@ -1,0 +1,380 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Descartes CHB — IEEPA Code Updater</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: #0f1923; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useCallback, useRef } = React;
+
+    const IEEPA_CODES = new Set([
+      "99030101","99030102","99030103","99030104","99030110","99030111",
+      "99030112","99030113","99030114","99030124","99030125","99030126",
+      "99030127","99030128","99030129","99030130","99030131","99030132",
+      "99030133","99030134","99030143","99030144","99030145","99030146",
+      "99030147","99030148","99030149","99030150","99030151","99030152",
+      "99030153","99030154","99030155","99030156","99030157","99030158",
+      "99030159","99030160","99030161","99030162","99030163","99030164",
+      "99030165","99030166","99030167","99030168","99030169","99030170",
+      "99030171","99030172","99030173","99030174","99030175","99030176",
+      "99030177","99030181","99030182","99030183","99030190",
+      "99030202","99030203","99030204","99030205","99030206","99030207",
+      "99030208","99030209","99030210","99030211","99030212","99030213",
+      "99030214","99030215","99030216","99030217","99030218","99030219",
+      "99030220","99030221","99030222","99030223","99030224","99030225",
+      "99030226","99030227","99030228","99030229","99030231","99030232",
+      "99030233","99030234","99030235","99030236","99030237","99030238",
+      "99030239","99030240","99030241","99030242","99030243","99030244",
+      "99030245","99030246","99030247","99030248","99030249","99030250",
+      "99030251","99030252","99030253","99030254","99030255","99030257",
+      "99030258","99030259","99030260","99030261","99030262","99030263",
+      "99030264","99030265","99030266","99030267","99030268","99030269",
+      "99030270","99030271","99030272","99030273","99030278","99030279",
+      "99030280","99030282","99030283","99030284","99030285","99030286",
+      "99030287","99030288","99030289","99030290","99030291"
+    ]);
+
+    // Default replacement for all IEEPA codes
+    const REPLACEMENT = "99030301";
+    // Special replacement: if the first IEEPA code found on a line is 99030133, use this instead
+    const REPLACEMENT_133 = "99030306";
+
+    function getCodeType(code) {
+      const c = (code || "").trim();
+      if (!c) return null;
+      if (c.startsWith("990388") || c.startsWith("990389")) return "SEC301";
+      if (c.startsWith("990380")) return "SEC232";
+      if (c.startsWith("990303")) return "SEC122";
+      if (IEEPA_CODES.has(c)) return "IEEPA";
+      if (c.startsWith("9903") || c.startsWith("9902") || c.startsWith("9901")) return "CH99-OTHER";
+      if (/^\d/.test(c)) return "COMMODITY";
+      return null;
+    }
+
+    const SEQ_PRIORITY = { "SEC301": 1, "SEC122": 2, "SEC232": 3, "CH99-OTHER": 4, "COMMODITY": 99 };
+
+    function processFile(arrayBuffer) {
+      const decoder = new TextDecoder("utf-8");
+      const text = decoder.decode(new Uint8Array(arrayBuffer));
+      const lines = text.split("\r\n");
+
+      if (lines.length < 4) throw new Error("File does not appear to be a valid Descartes CHB export.");
+      if (!lines[0].includes("[IESPDIMP]")) throw new Error("Missing [IESPDIMP] token. Is this a Descartes CHB Parts export?");
+      if (!lines[0].includes("[VERSION5]")) throw new Error("Only VERSION5 format is supported.");
+
+      const headers = lines[3].split("\t");
+      const tariffPositions = headers.reduce((acc, h, i) => {
+        if (h === "TARIFF NUM") acc.push(i);
+        return acc;
+      }, []);
+
+      if (tariffPositions.length === 0) throw new Error("No TARIFF NUM columns found in file headers.");
+
+      const headerLines = lines.slice(0, 4);
+      const dataLines = lines.slice(4).filter(l => l.length > 0);
+
+      const stats = {
+        total: dataLines.length,
+        updated: 0,
+        unchanged: 0,
+        unchanged_parts: [],
+        dupes_blanked: 0,
+        resequenced: 0,
+        codes_found: {},
+        sequence_log: [],
+      };
+
+      const newDataLines = dataLines.map(line => {
+        const fields = line.split("\t");
+        while (fields.length < headers.length) fields.push("");
+
+        // Step 1: Replace IEEPA codes
+        // First IEEPA code found → replacement (99030306 if it was 99030133, else 99030301)
+        // Any additional IEEPA codes on same record → blank
+        let firstReplaced = false;
+        for (const pos of tariffPositions) {
+          const stripped = (fields[pos] || "").trim();
+          if (IEEPA_CODES.has(stripped)) {
+            stats.codes_found[stripped] = (stats.codes_found[stripped] || 0) + 1;
+            if (!firstReplaced) {
+              // NEW RULE: 99030133 as the first tariff gets its own specific replacement
+              fields[pos] = (stripped === "99030133") ? REPLACEMENT_133 : REPLACEMENT;
+              firstReplaced = true;
+            } else {
+              fields[pos] = "";
+              stats.dupes_blanked++;
+            }
+          }
+        }
+
+        if (!firstReplaced) {
+          stats.unchanged++;
+          stats.unchanged_parts.push(fields[0]);
+          return fields.join("\t");
+        }
+        stats.updated++;
+
+        // Step 2: Check and fix CBP sequence order among non-empty tariff slots
+        const filledSlots = tariffPositions
+          .map(pos => ({ pos, code: (fields[pos] || "").trim() }))
+          .filter(s => s.code !== "");
+
+        const typedSlots = filledSlots.map(s => ({ ...s, type: getCodeType(s.code) }));
+        const priorities = typedSlots.map(s => SEQ_PRIORITY[s.type] || 50);
+        const isSorted = priorities.every((p, i) => i === 0 || priorities[i - 1] <= p);
+
+        if (!isSorted) {
+          const sorted = [...typedSlots].sort((a, b) => (SEQ_PRIORITY[a.type] || 50) - (SEQ_PRIORITY[b.type] || 50));
+          const slotPositions = filledSlots.map(s => s.pos);
+          sorted.forEach((s, i) => { fields[slotPositions[i]] = s.code; });
+          stats.resequenced++;
+          stats.sequence_log.push({
+            part: fields[0],
+            before: typedSlots.map(s => s.code),
+            after: sorted.map(s => s.code),
+          });
+        }
+
+        return fields.join("\t");
+      });
+
+      const outputText = [...headerLines, ...newDataLines].join("\r\n") + "\r\n";
+      const outputBytes = new TextEncoder().encode(outputText);
+      return { outputBytes, stats };
+    }
+
+    function App() {
+      const [dragOver, setDragOver] = useState(false);
+      const [fileName, setFileName] = useState(null);
+      const [processing, setProcessing] = useState(false);
+      const [result, setResult] = useState(null);
+      const [error, setError] = useState(null);
+      const [downloadUrl, setDownloadUrl] = useState(null);
+      const [downloadName, setDownloadName] = useState(null);
+      const [showSeqLog, setShowSeqLog] = useState(false);
+      const inputRef = useRef();
+
+      const handleFile = useCallback((file) => {
+        if (!file) return;
+        if (!file.name.toLowerCase().endsWith(".txt")) { setError("Please upload a .txt file."); return; }
+        setError(null); setResult(null); setFileName(file.name); setProcessing(true);
+        const reader = new FileReader();
+        reader.onload = (e) => {
+          try {
+            const { outputBytes, stats } = processFile(e.target.result);
+            const blob = new Blob([outputBytes], { type: "text/plain" });
+            setDownloadUrl(URL.createObjectURL(blob));
+            setDownloadName(file.name.replace(/\.txt$/i, "_updated.txt"));
+            setResult(stats);
+          } catch (err) { setError(err.message); }
+          finally { setProcessing(false); }
+        };
+        reader.onerror = () => { setError("Failed to read file."); setProcessing(false); };
+        reader.readAsArrayBuffer(file);
+      }, []);
+
+      const onDrop = useCallback((e) => { e.preventDefault(); setDragOver(false); handleFile(e.dataTransfer.files[0]); }, [handleFile]);
+
+      const reset = () => {
+        setFileName(null); setResult(null); setError(null);
+        setDownloadUrl(null); setDownloadName(null); setShowSeqLog(false);
+        if (inputRef.current) inputRef.current.value = "";
+      };
+
+      const uniqueCodes = result ? Object.keys(result.codes_found).sort() : [];
+
+      const S = {
+        page: { minHeight: "100vh", background: "#0f1923", fontFamily: "'IBM Plex Mono','Courier New',monospace", color: "#e2e8f0", display: "flex", flexDirection: "column" },
+        hdr: { borderBottom: "1px solid #1e3a4a", padding: "20px 40px", display: "flex", alignItems: "center", gap: "16px", background: "#0a1219" },
+        icon: { width: "36px", height: "36px", background: "linear-gradient(135deg,#0ea5e9,#0284c7)", borderRadius: "6px", display: "flex", alignItems: "center", justifyContent: "center", fontSize: "18px", flexShrink: 0 },
+        main: { flex: 1, padding: "40px", maxWidth: "820px", margin: "0 auto", width: "100%" },
+        infoBanner: { background: "rgba(14,165,233,0.05)", border: "1px solid #1e3a4a", borderRadius: "8px", padding: "14px 20px", marginBottom: "24px", fontSize: "11px", color: "#475569", lineHeight: "1.8" },
+        dropZone: (over) => ({ border: `2px dashed ${over ? "#0ea5e9" : "#1e3a4a"}`, borderRadius: "12px", padding: "60px 40px", textAlign: "center", cursor: "pointer", background: over ? "rgba(14,165,233,0.05)" : "rgba(14,165,233,0.02)", transition: "all 0.2s ease", marginBottom: "24px" }),
+        errBox: { background: "rgba(239,68,68,0.1)", border: "1px solid rgba(239,68,68,0.3)", borderRadius: "8px", padding: "16px 20px", marginBottom: "24px", color: "#fca5a5", fontSize: "13px", display: "flex", gap: "10px", alignItems: "flex-start" },
+        successBox: { background: "rgba(16,185,129,0.1)", border: "1px solid rgba(16,185,129,0.3)", borderRadius: "10px", padding: "20px 24px", marginBottom: "24px", display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: "16px" },
+        dlBtn: { background: "linear-gradient(135deg,#0ea5e9,#0284c7)", color: "#fff", padding: "10px 22px", borderRadius: "6px", textDecoration: "none", fontFamily: "'IBM Plex Sans',sans-serif", fontWeight: 600, fontSize: "13px", letterSpacing: "0.04em", display: "flex", alignItems: "center", gap: "8px", whiteSpace: "nowrap" },
+        statGrid: { display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: "12px", marginBottom: "16px" },
+        statCard: (color) => ({ background: "#0a1219", border: "1px solid #1e3a4a", borderRadius: "8px", padding: "14px 16px" }),
+        panel: { background: "#0a1219", border: "1px solid #1e3a4a", borderRadius: "8px", padding: "16px 20px", marginBottom: "12px" },
+        warnPanel: { background: "rgba(245,158,11,0.05)", border: "1px solid rgba(245,158,11,0.25)", borderRadius: "8px", padding: "14px 20px", marginBottom: "12px" },
+        label: { fontSize: "10px", color: "#475569", letterSpacing: "0.1em", marginBottom: "10px" },
+        tag: (color) => ({ background: `rgba(${color},0.1)`, border: `1px solid rgba(${color},0.25)`, borderRadius: "4px", padding: "4px 10px", fontSize: "12px" }),
+        ftr: { borderTop: "1px solid #1e3a4a", padding: "14px 40px", fontSize: "11px", color: "#334155", letterSpacing: "0.05em", display: "flex", justifyContent: "space-between" },
+      };
+
+      return (
+        <div style={S.page}>
+          <div style={S.hdr}>
+            <div style={S.icon}>⚙</div>
+            <div>
+              <div style={{ fontFamily: "'IBM Plex Sans',sans-serif", fontWeight: 700, fontSize: "15px", letterSpacing: "0.05em", color: "#f1f5f9" }}>DESCARTES CHB — IEEPA CODE UPDATER</div>
+              <div style={{ fontSize: "11px", color: "#64748b", letterSpacing: "0.08em", marginTop: "2px" }}>
+                Replaces 9903.01.xx / 9903.02.xx → 9903.03.01 (Section 122) · 9903.01.33 → 9903.03.06 · Enforces CBP HTS sequence order
+              </div>
+            </div>
+          </div>
+
+          <div style={S.main}>
+            {!result && !processing && (
+              <div style={S.infoBanner}>
+                <span style={{ color: "#0ea5e9", fontWeight: 600, letterSpacing: "0.05em" }}>CBP SEQUENCE APPLIED: </span>
+                <span style={{ color: "#64748b" }}>Sec 301 (9903.88.xx) </span>
+                <span style={{ color: "#475569" }}>→ </span>
+                <span style={{ color: "#6ee7b7" }}>Sec 122 / 9903.03.01 ← our replacement </span>
+                <span style={{ color: "#475569" }}>→ </span>
+                <span style={{ color: "#64748b" }}>Sec 232 (9903.80.xx) </span>
+                <span style={{ color: "#475569" }}>→ </span>
+                <span style={{ color: "#64748b" }}>Commodity HTS (Ch 1–97)</span>
+                <br />
+                <span style={{ color: "#fbbf24", fontWeight: 600, letterSpacing: "0.05em" }}>SPECIAL RULE: </span>
+                <span style={{ color: "#64748b" }}>9903.01.33 as first tariff → replaced with 9903.03.06 instead of 9903.03.01</span>
+              </div>
+            )}
+
+            {!result && (
+              <div style={S.dropZone(dragOver)}
+                onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
+                onDragLeave={() => setDragOver(false)}
+                onDrop={onDrop}
+                onClick={() => inputRef.current?.click()}>
+                <input ref={inputRef} type="file" accept=".txt" onChange={e => handleFile(e.target.files[0])} style={{ display: "none" }} />
+                <div style={{ fontSize: "40px", marginBottom: "16px" }}>📂</div>
+                {processing
+                  ? <div style={{ color: "#0ea5e9", fontSize: "14px", letterSpacing: "0.05em" }}>PROCESSING...</div>
+                  : <>
+                      <div style={{ fontFamily: "'IBM Plex Sans',sans-serif", fontSize: "16px", fontWeight: 600, color: "#94a3b8", marginBottom: "8px" }}>Drop your Descartes .txt file here</div>
+                      <div style={{ fontSize: "12px", color: "#475569", letterSpacing: "0.05em" }}>or click to browse — VERSION5 format only</div>
+                    </>
+                }
+              </div>
+            )}
+
+            {error && (
+              <div style={S.errBox}>
+                <span>⚠</span>
+                <div><div style={{ fontWeight: 600, marginBottom: "4px" }}>ERROR</div><div>{error}</div></div>
+              </div>
+            )}
+
+            {result && (
+              <div>
+                <div style={S.successBox}>
+                  <div style={{ display: "flex", alignItems: "center", gap: "12px" }}>
+                    <span style={{ fontSize: "24px" }}>✓</span>
+                    <div>
+                      <div style={{ fontFamily: "'IBM Plex Sans',sans-serif", fontWeight: 700, color: "#6ee7b7", fontSize: "14px" }}>FILE PROCESSED SUCCESSFULLY</div>
+                      <div style={{ fontSize: "12px", color: "#64748b", marginTop: "3px" }}>{fileName}</div>
+                    </div>
+                  </div>
+                  <a href={downloadUrl} download={downloadName} style={S.dlBtn}>⬇ DOWNLOAD {downloadName}</a>
+                </div>
+
+                <div style={S.statGrid}>
+                  {[
+                    { label: "TOTAL RECORDS", value: result.total, color: "#94a3b8" },
+                    { label: "RECORDS UPDATED", value: result.updated, color: "#0ea5e9" },
+                    { label: "UNCHANGED", value: result.unchanged, color: "#475569" },
+                    { label: "RESEQUENCED", value: result.resequenced, color: result.resequenced > 0 ? "#f59e0b" : "#334155" },
+                  ].map(s => (
+                    <div key={s.label} style={S.statCard(s.color)}>
+                      <div style={{ fontSize: "9px", color: "#475569", letterSpacing: "0.1em", marginBottom: "8px" }}>{s.label}</div>
+                      <div style={{ fontFamily: "'IBM Plex Sans',sans-serif", fontSize: "26px", fontWeight: 700, color: s.color }}>{s.value}</div>
+                    </div>
+                  ))}
+                </div>
+
+                {result.dupes_blanked > 0 && (
+                  <div style={{ ...S.panel, display: "flex", gap: "10px", alignItems: "center", fontSize: "12px", color: "#94a3b8" }}>
+                    <span style={{ color: "#f59e0b" }}>⚡</span>
+                    <span><span style={{ color: "#fbbf24", fontWeight: 600 }}>{result.dupes_blanked}</span> duplicate IEEPA code{result.dupes_blanked !== 1 ? "s" : ""} blanked — only first per record kept</span>
+                  </div>
+                )}
+
+                {result.resequenced > 0 && (
+                  <div style={S.warnPanel}>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: showSeqLog ? "12px" : 0 }}>
+                      <div style={{ fontSize: "11px", color: "#fbbf24", letterSpacing: "0.06em" }}>
+                        ⚠ {result.resequenced} RECORD{result.resequenced !== 1 ? "S" : ""} RESEQUENCED TO COMPLY WITH CBP HTS ORDER
+                      </div>
+                      <button onClick={() => setShowSeqLog(!showSeqLog)}
+                        style={{ background: "none", border: "1px solid rgba(245,158,11,0.3)", color: "#f59e0b", borderRadius: "4px", padding: "3px 10px", cursor: "pointer", fontSize: "11px", fontFamily: "'IBM Plex Mono',monospace" }}>
+                        {showSeqLog ? "HIDE" : "DETAILS"}
+                      </button>
+                    </div>
+                    {showSeqLog && result.sequence_log.map((entry, i) => (
+                      <div key={i} style={{ marginTop: "10px", padding: "10px 14px", background: "rgba(0,0,0,0.3)", borderRadius: "6px", fontSize: "11px" }}>
+                        <div style={{ color: "#94a3b8", marginBottom: "6px", fontWeight: 600 }}>{entry.part}</div>
+                        <div style={{ color: "#ef4444", marginBottom: "4px" }}>BEFORE: {entry.before.join(" → ")}</div>
+                        <div style={{ color: "#6ee7b7" }}>AFTER:  {entry.after.join(" → ")}</div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {uniqueCodes.length > 0 && (
+                  <div style={S.panel}>
+                    <div style={S.label}>IEEPA CODES REPLACED</div>
+                    <div style={{ display: "flex", flexWrap: "wrap", gap: "8px" }}>
+                      {uniqueCodes.map(code => (
+                        <div key={code} style={{ ...S.tag("239,68,68"), color: "#fca5a5", display: "flex", alignItems: "center", gap: "6px" }}>
+                          <span style={{ opacity: 0.5, fontSize: "10px" }}>✕</span>{code}
+                          <span style={{ fontSize: "10px", color: "#64748b" }}>×{result.codes_found[code]}</span>
+                        </div>
+                      ))}
+                    </div>
+                    <div style={{ marginTop: "12px", fontSize: "11px", color: "#475569", display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap" }}>
+                      <span>↳</span> replaced with
+                      <span style={{ ...S.tag("14,165,233"), color: "#7dd3fc", padding: "2px 8px" }}>99030301</span>
+                      (Section 122 / 9903.03.01) or
+                      <span style={{ ...S.tag("251,191,36"), color: "#fde68a", padding: "2px 8px" }}>99030306</span>
+                      (if first code was 9903.01.33)
+                    </div>
+                  </div>
+                )}
+
+                {result.unchanged_parts.length > 0 && (
+                  <div style={{ ...S.panel, marginBottom: "24px" }}>
+                    <div style={S.label}>RECORDS WITHOUT IEEPA CODES (UNCHANGED)</div>
+                    <div style={{ display: "flex", flexDirection: "column", gap: "4px", maxHeight: "160px", overflowY: "auto" }}>
+                      {result.unchanged_parts.map((p, i) => (
+                        <div key={i} style={{ fontSize: "12px", color: "#475569", padding: "3px 0", borderBottom: "1px solid #111c27" }}>{p}</div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                <button onClick={reset}
+                  style={{ background: "transparent", border: "1px solid #1e3a4a", color: "#64748b", padding: "10px 20px", borderRadius: "6px", cursor: "pointer", fontFamily: "'IBM Plex Mono',monospace", fontSize: "12px", letterSpacing: "0.05em" }}
+                  onMouseOver={e => { e.target.style.borderColor = "#0ea5e9"; e.target.style.color = "#0ea5e9"; }}
+                  onMouseOut={e => { e.target.style.borderColor = "#1e3a4a"; e.target.style.color = "#64748b"; }}>
+                  ↩ PROCESS ANOTHER FILE
+                </button>
+              </div>
+            )}
+          </div>
+
+          <div style={S.ftr}>
+            <span>IFF CUSTOMS BROKERAGE — IEEPA TARIFF REMOVAL TOOL</span>
+            <span>DESCARTES VERSION5 · CBP SEQUENCE COMPLIANT</span>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById("root"));
+    root.render(<App />);
+  </script>
+</body>
+</html>
